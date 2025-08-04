@@ -38,19 +38,31 @@ def deliver_queued_messages(username):
             else:
                 sender, msg = parts
             with users_lock:
-                if (
-                    sender in users and username in users and
-                    users[sender]["status"] == "ONLINE" and
-                    distance(users[sender]["lat"], users[sender]["lon"], users[username]["lat"], users[username]["lon"]) <= users[sender]["raio"]
-                ):
-                    try:
-                        users[username]["conn"].send(f"MESSAGE;{sender};(Pendente) {msg}\n".encode('utf-8'))
-                    except Exception as e:
-                        print(f"Erro ao entregar mensagem pendente para {username}: {e}")
-                        temp_messages.append((sender, msg))
-                else:
+                # Se remetente não existe mais ou destinatário não está online, recoloca na fila
+                if sender not in users or username not in users or users[username]["status"] != "ONLINE":
                     temp_messages.append((sender, msg))
+                    rabbitmq_channel.basic_ack(delivery_tag=method_frame.delivery_tag)
+                    continue
+                
+                # Se remetente está online, verifica distância
+                if users[sender]["status"] == "ONLINE":
+                    dist = distance(users[sender]["lat"], users[sender]["lon"], 
+                                  users[username]["lat"], users[username]["lon"])
+                    if dist > users[sender]["raio"]:
+                        temp_messages.append((sender, msg))
+                        rabbitmq_channel.basic_ack(delivery_tag=method_frame.delivery_tag)
+                        continue
+                
+                # Entrega a mensagem
+                try:
+                    users[username]["conn"].send(f"MESSAGE;{sender};(Pendente) {msg}\n".encode('utf-8'))
+                except Exception as e:
+                    print(f"Erro ao entregar mensagem pendente para {username}: {e}")
+                    temp_messages.append((sender, msg))
+            
             rabbitmq_channel.basic_ack(delivery_tag=method_frame.delivery_tag)
+        
+        # Recoloca mensagens que não puderam ser entregues
         for sender, msg in temp_messages:
             rabbitmq_channel.basic_publish(
                 exchange='',
@@ -128,27 +140,43 @@ def handle_client(conn, addr):
                     recipient = partes[2]
                     mensagem = ';'.join(partes[3:])
                     with users_lock:
-                        if sender not in users or users[sender]["status"] != "ONLINE":
-                            conn.send("ERROR;Remetente não registrado ou offline\n".encode('utf-8'))
+                        if sender not in users:
+                            conn.send("ERROR;Remetente não registrado\n".encode('utf-8'))
                             continue
                         if recipient not in users:
-                            conn.send("ERROR;Destinatário não encontrado ou offline\n".encode('utf-8'))
+                            conn.send("ERROR;Destinatário não encontrado\n".encode('utf-8'))
                             continue
+                        
+                        sender_status = users[sender]["status"]
+                        recipient_status = users[recipient]["status"]
+                        
+                        # Se remetente está OFFLINE, sempre enfileira para entrega posterior
+                        if sender_status != "ONLINE":
+                            ensure_queue(recipient)
+                            with rabbitmq_lock:
+                                rabbitmq_channel.basic_publish(
+                                    exchange='',
+                                    routing_key=recipient,
+                                    body=f"{sender};{mensagem}",
+                                    properties=pika.BasicProperties(delivery_mode=2)
+                                )
+                            conn.send(f"QUEUED;{recipient}\n".encode('utf-8'))
+                            continue
+                        
+                        # Se remetente está ONLINE, verifica destinatário e distância
                         s_lat = users[sender]["lat"]
                         s_lon = users[sender]["lon"]
-                        r_lat = users[recipient]["lat"]
-                        r_lon = users[recipient]["lon"]
-                        r_raio = users[recipient]["raio"]
-                        r_status = users[recipient]["status"]
-                        dist = distance(s_lat, s_lon, r_lat, r_lon)
-                        if dist <= users[sender]["raio"] and r_status == "ONLINE":
+                        dist = distance(s_lat, s_lon, users[recipient]["lat"], users[recipient]["lon"])
+                        
+                        # Entrega imediata se destinatário ONLINE e dentro do raio
+                        if recipient_status == "ONLINE" and dist <= users[sender]["raio"]:
                             try:
                                 users[recipient]["conn"].send(f"MESSAGE;{sender};{mensagem}\n".encode('utf-8'))
                                 conn.send(f"ENVIADO;{recipient}\n".encode('utf-8'))
                             except Exception as e:
                                 conn.send(f"ERROR;Falha ao enviar mensagem para {recipient}\n".encode('utf-8'))
                         else:
-                            # Should queue if recipient is OFFLINE OR sender is outside their own radius
+                            # Enfileira se destinatário OFFLINE ou fora do raio
                             ensure_queue(recipient)
                             with rabbitmq_lock:
                                 rabbitmq_channel.basic_publish(
@@ -201,6 +229,11 @@ def handle_client(conn, addr):
                         if username in users:
                             users[username]["status"] = novo_status
                     conn.send(f"STATUS_SET;{username};{novo_status}\n".encode('utf-8'))
+                    
+                    # Entrega mensagens pendentes quando usuário fica ONLINE
+                    if novo_status == "ONLINE":
+                        deliver_queued_messages(username)
+                    
                     broadcast_refresh()
                 else:
                     conn.send("ERROR;Comando desconhecido\n".encode('utf-8'))
